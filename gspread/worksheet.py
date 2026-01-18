@@ -3451,3 +3451,285 @@ class Worksheet:
 
         values = self.get(pad_values=True)
         return find_table(values, top_left_range_name, direction)
+
+    def get_shape(
+        self, header_rows: int = 5, footer_rows: int = 3
+    ) -> Dict[str, Any]:
+        """Get worksheet shape for assessing table structure.
+
+        Returns first few rows and last few rows so you can assess:
+        - Does first row look like headers?
+        - Are subsequent rows in consistent shape?
+        - Are there empty rows/columns that should be trimmed?
+
+        :param int header_rows: Number of rows to fetch from top (default 5)
+        :param int footer_rows: Number of rows to fetch from bottom (default 3)
+        :returns: dict with spreadsheet title, worksheet title, and shape information
+        :rtype: dict
+
+        Example::
+
+            shape = worksheet.get_shape()
+            print(f"Total rows: {shape['total_rows']}")
+            print(f"First rows: {shape['first_rows']}")
+            print(f"Last rows: {shape['last_rows']}")
+        """
+        sh = self.spreadsheet
+        all_values = self.get_all_values()
+
+        if not all_values:
+            return {
+                "spreadsheet": sh.title,
+                "worksheet": self.title,
+                "total_rows": 0,
+                "total_cols": 0,
+                "first_rows": [],
+                "last_rows": [],
+                "has_data": False,
+            }
+
+        total_rows = len(all_values)
+        total_cols = max(len(row) for row in all_values) if all_values else 0
+
+        # Get first N rows
+        first_rows = all_values[:header_rows]
+
+        # Get last N rows (non-overlapping with first)
+        if total_rows > header_rows + footer_rows:
+            last_rows = all_values[-footer_rows:]
+            last_row_start = total_rows - footer_rows + 1
+        elif total_rows > header_rows:
+            last_rows = all_values[header_rows:]
+            last_row_start = header_rows + 1
+        else:
+            last_rows = []
+            last_row_start = None
+
+        return {
+            "spreadsheet": sh.title,
+            "worksheet": self.title,
+            "total_rows": total_rows,
+            "total_cols": total_cols,
+            "first_rows": first_rows,
+            "first_row_numbers": list(range(1, len(first_rows) + 1)),
+            "last_rows": last_rows,
+            "last_row_numbers": (
+                list(range(last_row_start, last_row_start + len(last_rows)))
+                if last_row_start
+                else []
+            ),
+            "has_data": total_rows > 0,
+        }
+
+    def has_table(self) -> Dict[str, Any]:
+        """Check if worksheet has a table defined.
+
+        :returns: dict with spreadsheet title, worksheet title, and table info
+        :rtype: dict
+
+        Example::
+
+            result = worksheet.has_table()
+            if result['has_table']:
+                for table in result['tables']:
+                    print(f"Table: {table['name']}")
+        """
+        sh = self.spreadsheet
+        metadata = sh.fetch_sheet_metadata()
+
+        for sheet in metadata.get("sheets", []):
+            if sheet.get("properties", {}).get("sheetId") == self.id:
+                tables = sheet.get("tables", [])
+                if tables:
+                    return {
+                        "spreadsheet": sh.title,
+                        "worksheet": self.title,
+                        "has_table": True,
+                        "tables": [
+                            {
+                                "table_id": t.get("tableId"),
+                                "name": t.get("name"),
+                                "range": t.get("range"),
+                                "columns": [
+                                    {
+                                        "name": col.get("columnName"),
+                                        "type": col.get("columnType"),
+                                        "index": col.get("columnIndex"),
+                                    }
+                                    for col in t.get("columnProperties", [])
+                                ],
+                            }
+                            for t in tables
+                        ],
+                    }
+        return {
+            "spreadsheet": sh.title,
+            "worksheet": self.title,
+            "has_table": False,
+            "tables": [],
+        }
+
+    def get_banded_ranges(self) -> List[Dict[str, Any]]:
+        """Get all banded ranges (alternating row colors) on the worksheet.
+
+        Banded ranges can block table creation - they must be removed first.
+
+        :returns: list of banded range dicts with 'id' and 'range' info
+        :rtype: list
+
+        Example::
+
+            banded = worksheet.get_banded_ranges()
+            for br in banded:
+                print(f"Banded range ID: {br['id']}")
+        """
+        sh = self.spreadsheet
+        metadata = sh.fetch_sheet_metadata()
+
+        for sheet in metadata.get("sheets", []):
+            if sheet.get("properties", {}).get("sheetId") == self.id:
+                banded = sheet.get("bandedRanges", [])
+                return [
+                    {"id": br.get("bandedRangeId"), "range": br.get("range")}
+                    for br in banded
+                ]
+        return []
+
+    def remove_banded_ranges(self) -> Dict[str, Any]:
+        """Remove all banded ranges (alternating row colors) from the worksheet.
+
+        This is required before converting to a table, as banded ranges
+        conflict with table creation.
+
+        :returns: dict with spreadsheet title, worksheet title, and count of removed ranges
+        :rtype: dict
+
+        Note:
+            Uses 'deleteBanding' API request (not 'deleteBandedRange').
+
+        Example::
+
+            result = worksheet.remove_banded_ranges()
+            print(f"Removed {result['removed']} banded ranges")
+        """
+        banded = self.get_banded_ranges()
+        sh = self.spreadsheet
+
+        if not banded:
+            return {"spreadsheet": sh.title, "worksheet": self.title, "removed": 0}
+
+        # IMPORTANT: The correct API field is 'deleteBanding', not 'deleteBandedRange'
+        requests = [{"deleteBanding": {"bandedRangeId": br["id"]}} for br in banded]
+        sh.batch_update({"requests": requests})
+
+        return {"spreadsheet": sh.title, "worksheet": self.title, "removed": len(banded)}
+
+    def convert_to_table(
+        self,
+        name: Optional[str] = None,
+        start_row: int = 1,
+        start_col: int = 1,
+        end_row: Optional[int] = None,
+        end_col: Optional[int] = None,
+        auto_remove_banding: bool = True,
+    ) -> Dict[str, Any]:
+        """Convert worksheet data range to a table.
+
+        :param str name: Table name (defaults to worksheet title + "_table")
+        :param int start_row: Starting row (1-indexed, default 1)
+        :param int start_col: Starting column (1-indexed, default 1)
+        :param int end_row: Ending row (1-indexed, default last row with data)
+        :param int end_col: Ending column (1-indexed, default last column with data)
+        :param bool auto_remove_banding: If True (default), automatically removes
+            any existing banded ranges (alternating colors) that would block
+            table creation.
+
+        :returns: dict with created table info, including 'banding_removed' count
+        :rtype: dict
+
+        :raises ValueError: If worksheet has no data to convert to table
+        :raises gspread.exceptions.APIError: If banded ranges exist and
+            auto_remove_banding=False
+
+        Example::
+
+            result = worksheet.convert_to_table(name="my_table")
+            print(f"Created table: {result['table_name']}")
+        """
+        sh = self.spreadsheet
+
+        # Remove banded ranges first - they block table creation
+        banding_removed = 0
+        if auto_remove_banding:
+            result = self.remove_banded_ranges()
+            banding_removed = result["removed"]
+
+        if end_row is None or end_col is None:
+            all_values = self.get_all_values()
+            if not all_values:
+                raise ValueError("Worksheet has no data to convert to table")
+            if end_row is None:
+                end_row = len(all_values)
+            if end_col is None:
+                end_col = max(len(row) for row in all_values)
+
+        if name is None:
+            name = f"{self.title}_table"
+
+        # GridRange uses 0-indexed values
+        table_range = {
+            "sheetId": self.id,
+            "startRowIndex": start_row - 1,
+            "endRowIndex": end_row,
+            "startColumnIndex": start_col - 1,
+            "endColumnIndex": end_col,
+        }
+
+        request = {
+            "requests": [{"addTable": {"table": {"name": name, "range": table_range}}}]
+        }
+
+        response = sh.batch_update(request)
+
+        return {
+            "success": True,
+            "spreadsheet": sh.title,
+            "worksheet": self.title,
+            "table_name": name,
+            "range": {
+                "start_row": start_row,
+                "end_row": end_row,
+                "start_col": start_col,
+                "end_col": end_col,
+            },
+            "banding_removed": banding_removed,
+            "response": response,
+        }
+
+    def delete_table(self, table_id: str) -> Dict[str, Any]:
+        """Delete a table from the worksheet.
+
+        :param str table_id: The table ID to delete
+
+        :returns: dict with spreadsheet title, worksheet title, and result
+        :rtype: dict
+
+        Example::
+
+            # First, get the table ID
+            tables = worksheet.has_table()
+            if tables['has_table']:
+                table_id = tables['tables'][0]['table_id']
+                worksheet.delete_table(table_id)
+        """
+        sh = self.spreadsheet
+
+        request = {"requests": [{"deleteTable": {"tableId": table_id}}]}
+
+        response = sh.batch_update(request)
+        return {
+            "success": True,
+            "spreadsheet": sh.title,
+            "worksheet": self.title,
+            "response": response,
+        }
